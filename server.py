@@ -258,7 +258,9 @@ def status():
             "level_generator": True,
             "npc_engine": True,
         },
-        "ai_enabled": bool(os.getenv("DASHSCOPE_API_KEY")),
+        "ai_enabled": bool(os.getenv("AI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DASHSCOPE_API_KEY")),
+        "ai_provider": os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1"),
+        "ai_model": os.getenv("AI_MODEL") or os.getenv("DASHSCOPE_MODEL") or "deepseek-chat",
     })
 
 # ===================== REPLICATE VISUALS =====================
@@ -432,7 +434,7 @@ if __name__ == "__main__":
 ║  GET  /api/assets-img/<path>             ║
 ║  GET  /api/assets-status                 ║
 ╠══════════════════════════════════════════╣
-║  AI (Qwen): {"ENABLED" if os.getenv('DASHSCOPE_API_KEY') else "DISABLED":<32}║
+║  AI (LLM):  {"ENABLED" if (os.getenv('AI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('DASHSCOPE_API_KEY')) else "DISABLED":<32}║
 ║  Replicate: {"ENABLED" if os.getenv('REPLICATE_API_TOKEN') else "DISABLED":<32}║
 ║  Port: {port:<34}║
 ╚══════════════════════════════════════════╝

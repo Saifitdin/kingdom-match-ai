@@ -13,8 +13,13 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")
+# Универсальный OpenAI-совместимый клиент: DeepSeek/Qwen/OpenAI/любой
+AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
+AI_MODEL = os.getenv("AI_MODEL") or os.getenv("DASHSCOPE_MODEL") or "deepseek-chat"
+# Алиасы для обратной совместимости в коде ниже
+DASHSCOPE_API_KEY = AI_API_KEY
+DASHSCOPE_MODEL = AI_MODEL
 
 
 @dataclass
@@ -121,7 +126,7 @@ Output ONLY JSON array:
 Tone: epic, energetic, cinematic. Characters speak short and punchy."""
 
     try:
-        url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        url = AI_BASE_URL.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"}
         payload = {"model": DASHSCOPE_MODEL, "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.9, "max_tokens": 800}

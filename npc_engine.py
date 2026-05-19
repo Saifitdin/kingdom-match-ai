@@ -17,8 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")
+AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
+AI_MODEL = os.getenv("AI_MODEL") or os.getenv("DASHSCOPE_MODEL") or "deepseek-chat"
+DASHSCOPE_API_KEY = AI_API_KEY
+DASHSCOPE_MODEL = AI_MODEL
 
 
 # ----- Типы квестов -----
@@ -345,7 +348,7 @@ def _dialogue_ai(npc: NPC, state: dict, context: str, fallback: str) -> Optional
 Напиши ОДНУ короткую реплику (1-2 предложения) от лица {npc.name}, 
 отражающую личность и текущую ситуацию. На русском языке. Только реплика, без пояснений."""
 
-    url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    url = AI_BASE_URL.rstrip("/") + "/chat/completions"
     headers = {
         "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
         "Content-Type": "application/json",

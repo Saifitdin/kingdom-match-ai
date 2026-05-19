@@ -1,0 +1,668 @@
+/**
+ * Kingdom Match AI Client — v0.1
+ * Интегрирует AI-противника, генератор уровней и NPC в игру.
+ * 
+ * Подключение: <script src="km_ai_client.js"></script>
+ * Требует запущенный AI-сервер на http://localhost:5050
+ *
+ * Добавляет в Game:
+ *   Game.ai.enabled          — AI активен
+ *   Game.ai.bot              — текущий бот-противник
+ *   Game.ai.botCooldown      — ходов до следующей атаки
+ *   Game.ai.quests[]         — активные квесты
+ *   Game.ai.checkBotAttack() — проверка и запуск атаки бота
+ *   Game.ai.talkToNPC(id)    — диалог с NPC
+ *   Game.ai.generateLevels() — генерация AI-уровней
+ */
+
+(function() {
+  'use strict';
+
+  const AI_CONFIG = {
+    // Базовый URL AI-сервера
+    baseUrl: 'http://localhost:5050',
+    // Задержка между атаками бота (в ходах, сервер может переопределить)
+    defaultCooldown: 5,
+    // Показывать ли AI-интерфейс
+    enabled: true,
+    // Имитировать AI локально если сервер недоступен
+    fallbackLocal: true,
+  };
+
+  // ============== AI MODULE ==============
+
+  const AI = {
+    enabled: AI_CONFIG.enabled,
+    serverOnline: false,
+    bot: null,
+    botCooldown: 0,
+    levelsSinceLastAttack: 0,
+    quests: [],
+    activeNPC: null,
+
+    async init() {
+      this.serverOnline = await this.ping();
+      if (!this.serverOnline && AI_CONFIG.fallbackLocal) {
+        console.log('[AI] Сервер недоступен — использую локальный fallback');
+      }
+      console.log('[AI] Инициализирован. Сервер:', this.serverOnline ? 'онлайн' : 'офлайн (fallback)');
+    },
+
+    async ping() {
+      try {
+        const resp = await fetch(AI_CONFIG.baseUrl + '/api/status');
+        return resp.ok;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    async apiCall(endpoint, data = {}) {
+      if (this.serverOnline) {
+        try {
+          const resp = await fetch(AI_CONFIG.baseUrl + endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+          });
+          if (resp.ok) return await resp.json();
+          console.warn('[AI] Ошибка сервера:', resp.status);
+        } catch (e) {
+          console.warn('[AI] Сервер недоступен:', e.message);
+          this.serverOnline = false;
+        }
+      }
+      return null;
+    },
+
+    // ----- BOT OPPONENT -----
+
+    async createBot() {
+      const s = Game.state;
+      if (!s.kingdom) return;
+
+      const data = {
+        kingdom: s.kingdom,
+        player_level: s.level,
+        difficulty: AI_CONFIG.difficulty || 'medium',
+        bot_action: 'create',
+      };
+
+      if (this.serverOnline) {
+        const resp = await this.apiCall('/api/bot-attack', data);
+        if (resp) {
+          this.bot = resp.bot;
+          this.botCooldown = resp.cooldown || AI_CONFIG.defaultCooldown;
+          return;
+        }
+      }
+
+      // Локальный fallback
+      this.bot = this._createLocalBot(s.kingdom, s.level);
+      this.botCooldown = this._localCooldown();
+    },
+
+    async botAttack() {
+      const s = Game.state;
+      if (!this.bot || !s.kingdom) return null;
+
+      const data = {
+        kingdom: s.kingdom,
+        player_level: s.level,
+        player_hp: s.hp,
+        player_defense: s.defense,
+        player_resources: s.resources,
+        player_era: s.era,
+        difficulty: this.bot.difficulty || 'medium',
+        bot_action: 'attack',
+      };
+
+      if (this.serverOnline) {
+        const resp = await this.apiCall('/api/bot-attack', data);
+        if (resp) {
+          this.bot = resp.bot;
+          this.botCooldown = resp.next_attack_in;
+          return resp.attack;
+        }
+      }
+
+      // Локальный fallback
+      const attack = this._localAttack(s);
+      this.botCooldown = this._localCooldown();
+      return attack;
+    },
+
+    checkBotAttack() {
+      if (!this.enabled || !this.bot) return;
+      this.levelsSinceLastAttack++;
+
+      if (this.levelsSinceLastAttack >= this.botCooldown) {
+        this.levelsSinceLastAttack = 0;
+        this._triggerBotAttack();
+        return;
+      }
+      // Предупреждение за 1 уровень до атаки — показать карту мира с подсветкой агрессора
+      const left = this.botCooldown - this.levelsSinceLastAttack;
+      if (left === 1 && window.UI && typeof UI.openWorld === 'function') {
+        setTimeout(() => UI.openWorld(true), 800);
+      }
+    },
+
+    async _triggerBotAttack() {
+      const s = Game.state;
+      if (!s.hp || s.hp <= 0) return;
+
+      const attack = await this.botAttack();
+      if (!attack) return;
+
+      // Показываем модалку с информацией об атаке
+      document.getElementById('botAttackNarrative').textContent = attack.narrative;
+      document.getElementById('botAttackDmg').textContent = attack.actual_damage;
+      document.getElementById('botAttackStolen').innerHTML = '';
+
+      if (attack.resources_stolen && Object.keys(attack.resources_stolen).length > 0) {
+        const stolenDiv = document.getElementById('botAttackStolen');
+        const era = ERAS[s.era];
+        Object.entries(attack.resources_stolen).forEach(([res, amount]) => {
+          const chip = document.createElement('span');
+          chip.className = 'r';
+          chip.innerHTML = `<span>${era.tiles[res] || res}</span><span>-${amount}</span>`;
+          stolenDiv.appendChild(chip);
+          s.resources[res] = Math.max(0, (s.resources[res] || 0) - amount);
+        });
+      }
+
+      // Применяем урон к крепости
+      s.hp = Math.max(0, s.hp - attack.actual_damage);
+
+      // Особые эффекты
+      if (attack.special_effect === 'poison') {
+        Game.state.poisonTurns = 3;
+      }
+
+      Game.save();
+      UI.refreshHUD();
+      UI.openModal('botAttackModal');
+      UI.renderKingdomIfActive();
+    },
+
+    // Локальный fallback бот
+    _createLocalBot(kingdom, level) {
+      const names = {
+        rus: ['Половецкий хан', 'Хазарский каган', 'Печенежский вождь'],
+        horde: ['Шах Хорезма', 'Сельджукский эмир', 'Кипчакский хан'],
+        china: ['Чжурчжэньский воевода', 'Тибетский генерал', 'Уйгурский каган'],
+      };
+      const pool = names[kingdom] || names.rus;
+      return {
+        name: pool[Math.floor(Math.random() * pool.length)],
+        difficulty: 'medium',
+        strategy: ['aggressive', 'balanced', 'resource_raid'][Math.floor(Math.random() * 3)],
+        power: 40 + level * 5 + Math.floor(Math.random() * 20),
+      };
+    },
+
+    _localCooldown() {
+      return 3 + Math.floor(Math.random() * 5);
+    },
+
+    _localAttack(s) {
+      const rawDmg = Math.floor(this.bot.power * (0.3 + Math.random() * 0.9));
+      const defFactor = Math.max(0.1, 1 - s.defense / (s.defense + 100));
+      const actualDmg = Math.max(1, Math.floor(rawDmg * defFactor));
+      const stolen = {};
+      if (Math.random() < 0.4) {
+        const resKeys = Object.keys(s.resources);
+        const res = resKeys[Math.floor(Math.random() * resKeys.length)];
+        if (s.resources[res] > 2) {
+          stolen[res] = Math.max(1, Math.floor(s.resources[res] * 0.1));
+        }
+      }
+      return {
+        bot_name: this.bot.name,
+        strategy: this.bot.strategy,
+        actual_damage: actualDmg,
+        resources_stolen: stolen,
+        special_effect: null,
+        narrative: `⚔️ **${this.bot.name}** атакует крепость!\n🛡️ Нанесено **${actualDmg}** урона.` +
+          (Object.keys(stolen).length ? `\n📦 Украдено ресурсов: ${JSON.stringify(stolen)}` : ''),
+      };
+    },
+
+    // ----- NPC -----
+
+    async talkToNPC(npcId) {
+      const s = Game.state;
+      const data = {
+        npc_id: npcId,
+        player_state: {
+          level: s.level, era: s.era,
+          hp: s.hp, hp_max: s.hpMax, defense: s.defense,
+          coins: s.coins, resources: s.resources,
+        },
+        context: 'greeting',
+        use_ai: this.serverOnline,
+      };
+
+      if (this.serverOnline) {
+        const resp = await this.apiCall('/api/npc-dialogue', data);
+        if (resp) {
+          document.getElementById('npcReply').textContent = resp.reply;
+          document.getElementById('npcName').textContent = resp.npc.name;
+          document.getElementById('npcAva').textContent = resp.npc.avatar;
+          UI.openModal('npcModal');
+          return;
+        }
+      }
+
+      // Локальный fallback
+      const localNPCs = this._getLocalNPCs();
+      const npc = localNPCs[npcId];
+      if (npc) {
+        document.getElementById('npcReply').textContent = npc.hello || 'Приветствую, правитель!';
+        document.getElementById('npcName').textContent = npc.name;
+        document.getElementById('npcAva').textContent = npc.avatar;
+        UI.openModal('npcModal');
+      }
+    },
+
+    async requestQuest(npcId) {
+      const data = {
+        npc_id: npcId,
+        player_level: Game.state.level,
+        player_resources: Game.state.resources,
+      };
+
+      if (this.serverOnline) {
+        const resp = await this.apiCall('/api/npc-quest', data);
+        if (resp) {
+          this.quests.push(resp.quest);
+          document.getElementById('npcReply').textContent = 
+            `📜 Новый квест: **${resp.quest.title}**\n${resp.quest.description}\nНаграда: ${resp.quest.reward_coins}🪙`;
+          document.getElementById('npcName').textContent = resp.npc.name;
+          document.getElementById('npcAva').textContent = resp.npc.avatar;
+          UI.openModal('npcModal');
+          return;
+        }
+      }
+
+      // Локальный fallback квест
+      const questTypes = [
+        { title: 'Пополнить казну', desc: 'Собери 300 золота для королевства', coins: 150 },
+        { title: 'Провиант для войска', desc: 'Собери 500 еды', coins: 100 },
+        { title: 'Укрепить твердыню', desc: 'Построй стены в крепости', coins: 250 },
+      ];
+      const q = questTypes[Math.floor(Math.random() * questTypes.length)];
+      this.quests.push({ ...q, id: 'q_' + Date.now(), progress: 0, completed: false });
+      document.getElementById('npcReply').textContent = 
+        `📜 Квест: **${q.title}**\n${q.desc}\nНаграда: ${q.coins}🪙`;
+      UI.openModal('npcModal');
+    },
+
+    _getLocalNPCs() {
+      const k = Game.state.kingdom || 'rus';
+      const npcs = {
+        rus: { velimir: { name: 'Старец Велимир', avatar: '🧙', hello: 'Здрав буди, княже! Что тревожит душу твою?' },
+                dobrynya: { name: 'Воевода Добрыня', avatar: '⚔️', hello: 'Докладывай, воевода. Что на рубежах?' },
+                marfa: { name: 'Купчиха Марфа', avatar: '👩‍🌾', hello: 'Ой, княже! Товар заморский привезла!' } },
+        horde: { batu: { name: 'Темник Бату', avatar: '🤵', hello: 'Сайн байна уу, хан! Какие вести из степи?' },
+                 altan: { name: 'Алтан-шаман', avatar: '🪬', hello: 'Духи шепчут... Ты пришёл за советом?' },
+                 gulnara: { name: 'Гульнара-бегим', avatar: '👸', hello: 'Мой караван привёз шёлк и пряности!' } },
+        china: { libo: { name: 'Мудрец Ли Бо', avatar: '👲', hello: 'Луна над пагодой светла... Какие думы тревожат императора?' },
+                 zhen: { name: 'Генерал Чжэнь', avatar: '🐉', hello: 'Войско построено, император. Жду приказа.' },
+                 mei: { name: 'Госпожа Мэй', avatar: '🪭', hello: 'Тсс... у меня сведения о враге.' } },
+      };
+      return npcs[k] || npcs.rus;
+    },
+
+    // ----- LEVEL GENERATOR -----
+
+    async generateLevels(count = 5) {
+      const s = Game.state;
+      const data = {
+        kingdom: s.kingdom,
+        era: s.era,
+        start_level: s.level,
+        count: count,
+        difficulty: 'normal',
+        use_ai: this.serverOnline,
+      };
+
+      if (this.serverOnline) {
+        const resp = await this.apiCall('/api/generate-levels', data);
+        if (resp) {
+          document.getElementById('aiLevelsResult').textContent = 
+            `✅ Сгенерировано ${resp.levels.length} AI-уровней (валидных: ${resp.validations.filter(v => v.valid).length}/${resp.validations.length})`;
+          Game.aiLevels = resp.levels;
+          return resp.levels;
+        }
+      }
+
+      // Локальный fallback
+      const levels = [];
+      for (let i = 0; i < count; i++) {
+        levels.push({
+          id: s.level + i,
+          name: `AI-уровень ${s.level + i}`,
+          enemyHP: 80 + (s.level + i) * 25,
+          timer: Math.max(45, 120 - Math.floor((s.level + i) / 2) * 2),
+        });
+      }
+      document.getElementById('aiLevelsResult').textContent = 
+        `✅ Сгенерировано ${count} уровней (локально)`;
+      Game.aiLevels = levels;
+      UI.refreshHUD();
+      return levels;
+    },
+
+    openNPCList() {
+      const npcs = this._getLocalNPCs();
+      const list = document.getElementById('npcList');
+      list.innerHTML = '';
+      Object.entries(npcs).forEach(([id, npc]) => {
+        const card = document.createElement('div');
+        card.className = 'npc-card';
+        card.innerHTML = `<span class="ava">${npc.avatar}</span><b>${npc.name}</b>`;
+        card.onclick = () => this.talkToNPC(id);
+        list.appendChild(card);
+      });
+      UI.show('npcScreen');
+    },
+  };
+
+  // ============== ИНТЕГРАЦИЯ ==============
+
+  // Хук: после инициализации игры запускаем AI
+  const origInit = Game.init;
+  Game.init = function() {
+    origInit.call(this);
+    if (AI_CONFIG.enabled) {
+      AI.init().then(() => {
+        if (this.state.kingdom) {
+          AI.createBot();
+          Visuals.load().then(() => {
+            if (Visuals.useImages) Visuals.applyKingdomBg();
+          });
+        }
+      });
+    }
+    this.ai = AI;
+  };
+
+  // Хук: после выбора королевства создаём бота
+  const origSelectKingdom = Game.selectKingdom;
+  Game.selectKingdom = function(k) {
+    origSelectKingdom.call(this, k);
+    if (AI.enabled) {
+      setTimeout(() => Comic.show(k, 'kingdom_select'), 700);
+      AI.createBot();
+      if (!Visuals.loaded) {
+        Visuals.load().then(() => {
+          if (Visuals.useImages) Visuals.applyKingdomBg();
+        });
+      }
+    }
+  };
+
+  // Хук: после победы на уровне проверяем бота
+  const origAfterWin = Game.afterWin;
+  Game.afterWin = function() {
+    origAfterWin.call(this);
+    if (AI.enabled) {
+      AI.checkBotAttack();
+    }
+  };
+
+  // Хук: после выхода с уровня (поражение)
+  const origExitLevel = Game.exitLevel;
+  Game.exitLevel = function() {
+    origExitLevel.call(this);
+    if (AI.enabled) {
+      AI.checkBotAttack();
+    }
+  };
+
+  // Хук: после рендера королевства — применяем фоны
+  const origRenderKingdom = UI.renderKingdom;
+  UI.renderKingdom = function() {
+    origRenderKingdom.call(this);
+    if (Visuals.useImages) {
+      Visuals.applyKingdomBg();
+      setTimeout(() => Visuals.applyFortress(), 100);
+    }
+  };
+
+  // Хук: после рендера игровой темы — применяем врага
+  const origRenderGameTheme = UI.renderGameTheme;
+  UI.renderGameTheme = function() {
+    origRenderGameTheme.call(this);
+    if (Visuals.useImages) {
+      Visuals.applyEnemyToGame();
+      Visuals.applyKingdomBg();
+    }
+  };
+
+  // Хук: после layout() — применяем иконки тайлов
+  const origLayout = Board.layout;
+  Board.layout = function() {
+    origLayout.call(this);
+    if (Visuals.useImages) Visuals.applyTiles();
+  };
+
+  // Хук: spawnCell — добавляем data-type
+  const origSpawnCell = Board.spawnCell;
+  Board.spawnCell = function(r, c, animate) {
+    origSpawnCell.call(this, r, c, animate);
+    const cell = this.grid[r]?.[c];
+    if (cell?.el) {
+      const icon = cell.el.querySelector('.icon');
+      if (icon && cell.type) icon.dataset.type = cell.type;
+    }
+  };
+
+  // ============== REPLICATE VISUALS ==============
+
+  const Visuals = {
+    assets: null,
+    loaded: false,
+    useImages: true,
+
+    async load() {
+      try {
+        const resp = await fetch(AI_CONFIG.baseUrl + '/api/assets');
+        if (resp.ok) {
+          this.assets = await resp.json();
+          this.loaded = true;
+          console.log('[Visuals] ' + 
+            (this.assets.enemies ? Object.values(this.assets.enemies).flat().length : 0) + ' enemies, ' +
+            (this.assets.kingdom_bgs ? Object.keys(this.assets.kingdom_bgs).length : 0) + ' bgs loaded');
+          return true;
+        }
+      } catch (e) {
+        console.log('[Visuals] Server not available:', e.message);
+      }
+      return false;
+    },
+
+    toggle() {
+      this.useImages = !this.useImages;
+      UI.renderKingdom();
+      UI.renderMap();
+      return this.useImages;
+    },
+
+    getEnemyImg(kingdom, enemyName) {
+      if (!this.useImages || !this.assets?.enemies?.[kingdom]) return null;
+      const found = this.assets.enemies[kingdom].find(e => e.name === enemyName);
+      return found?.url || null;
+    },
+
+    getKingdomBg(kingdom) {
+      if (!this.useImages || !this.assets?.kingdom_bgs?.[kingdom]) return null;
+      return this.assets.kingdom_bgs[kingdom];
+    },
+
+    getEraBg(era) {
+      if (!this.useImages || !this.assets?.era_bgs) return null;
+      const found = this.assets.era_bgs.find(e => e.era === era);
+      return found?.url || null;
+    },
+
+    getTileImg(tileType, era) {
+      if (!this.useImages || !this.assets?.tiles?.[tileType]) return null;
+      const imgs = this.assets.tiles[tileType];
+      return imgs[Math.min(era, imgs.length - 1)] || null;
+    },
+
+    applyEnemyToGame() {
+      if (!this.useImages || !this.assets) return;
+      const s = Game.state;
+      const k = KINGDOMS[s.kingdom];
+      const img = this.getEnemyImg(s.kingdom, k.enemy);
+      if (img) {
+        const fig = document.getElementById('enemyFigure');
+        if (fig) {
+          fig.innerHTML = `<img src="${img}" style="width:60px;height:60px;border-radius:50%;object-fit:cover;border:2px solid #e63946" onerror="this.style.display='none'">`;
+        }
+      }
+    },
+
+    applyKingdomBg() {
+      if (!this.useImages || !this.assets) return;
+      const s = Game.state;
+      const bg = this.getKingdomBg(s.kingdom);
+      if (bg) {
+        const kbg = document.getElementById('kbg');
+        if (kbg) { kbg.style.backgroundImage = `url(${bg})`; kbg.style.backgroundSize = 'cover'; kbg.style.backgroundPosition = 'center'; }
+      }
+      const eraBg = this.getEraBg(s.era);
+      if (eraBg) {
+        const gbg = document.getElementById('gbg');
+        if (gbg) gbg.style.backgroundImage = `url(${eraBg})`;
+      }
+    },
+
+    applyTiles() {
+      if (!this.useImages || !this.assets?.tiles || !Object.keys(this.assets.tiles).length) return;
+      const era = Game.state.era;
+      const cells = document.querySelectorAll('#board .cell .icon');
+      cells.forEach(icon => {
+        const tileType = icon.dataset.type;
+        if (!tileType || !this.assets.tiles[tileType]) return;
+        const eraList = this.assets.tiles[tileType];
+        if (!eraList || !eraList.length) return;
+        let match = eraList.find(e => e.era === era);
+        if (!match) {
+          const sorted = [...eraList].sort((a, b) => a.era - b.era);
+          match = sorted.filter(e => e.era <= era).pop() || sorted[sorted.length - 1];
+        }
+        const url = match.url;
+        if (url) {
+          icon.innerHTML = `<img src="${url}" style="width:100%;height:100%;object-fit:contain">`;
+          icon.style.fontSize = '0';
+        }
+      });
+    },
+
+    applyFortress() {
+      if (!this.useImages || !this.assets?.fortress) return;
+      const f = this.assets.fortress;
+      // У каждой постройки своя «форма»: квадратные PNG обрезаем под силуэт здания
+      const slots = [
+        { key:'castle', sel:'.iso-bld.castle .sprite', w:1.4, h:1.4, clip:'inset(0)' },
+        { key:'tower',  sel:'.iso-bld.tower .sprite',  w:0.9, h:1.5, clip:'inset(0 22% 0 22%)' },
+        { key:'walls',  sel:'.iso-bld.wall .sprite',   w:1.6, h:0.9, clip:'inset(30% 0 10% 0)' },
+        { key:'gate',   sel:'.iso-bld.gate .sprite',   w:1.1, h:1.1, clip:'inset(8% 12% 0 12%)' }
+      ];
+      slots.forEach(s => {
+        if (!f[s.key]) return;
+        document.querySelectorAll(s.sel).forEach(el => {
+          if (el.querySelector('img')) return;
+          const size = parseFloat(getComputedStyle(el).fontSize) || 48;
+          const w = Math.round(size * s.w);
+          const h = Math.round(size * s.h);
+          el.style.fontSize = '0';
+          el.innerHTML = `<img src="${f[s.key]}" style="width:${w}px;height:${h}px;display:block;object-fit:cover;clip-path:${s.clip}" onerror="this.parentElement.style.fontSize='${size}px';this.remove()">`;
+        });
+      });
+    },
+  };
+
+  Game.visuals = Visuals;
+
+  // ============== COMIC ==============
+
+  window.Comic = {
+    panels: [],
+    current: 0,
+    story: null,
+
+    async show(kingdom, trigger) {
+      kingdom = kingdom || Game.state.kingdom || 'rus';
+      trigger = trigger || 'kingdom_select';
+
+      try {
+        const resp = await fetch(AI_CONFIG.baseUrl + `/api/comic-story?kingdom=${kingdom}&trigger=${trigger}&level=${Game.state.level}&era=${Game.state.era}`);
+        if (resp.ok) this.story = await resp.json();
+      } catch(e) {}
+
+      if (!this.story || !this.story.panels || !this.story.panels.length) {
+        this.story = this._localStory(kingdom);
+      }
+
+      this.panels = this.story.panels;
+      this.current = 0;
+      this._renderDots();
+      this._renderPanel();
+      UI.show('comicScreen');
+    },
+
+    _localStory(k) {
+      const tpl = {
+        rus: {title:'Князь и Степь', panels:[
+          {layout:'top_banner',caption:'Русь, XII век',speaker:'Старец Велимир',dialogue:'Княже! Враг у ворот. Возьми меч предков!',image_prompt:''},
+          {layout:'full',speaker:'Narrator',dialogue:'Так начинается путь... От частокола до каменных стен.',image_prompt:''},
+        ]},
+        horde: {title:'Хан Великой Степи', panels:[
+          {layout:'top_banner',caption:'Великая Степь, XIII век',speaker:'Темник Бату',dialogue:'Хан! Твои тумены ждут. Покажи врагу силу Орды!',image_prompt:''},
+          {layout:'full',speaker:'Narrator',dialogue:'От юрты до дворца. Степь помнит героев.',image_prompt:''},
+        ]},
+        china: {title:'Император Поднебесной', panels:[
+          {layout:'top_banner',caption:'Империя Тан',speaker:'Мудрец Ли Бо',dialogue:'Император! Путь в тысячу ли — с первого шага.',image_prompt:''},
+          {layout:'full',speaker:'Narrator',dialogue:'От бамбука до Великой стены. Небеса наблюдают.',image_prompt:''},
+        ]},
+      };
+      return tpl[k] || tpl.rus;
+    },
+
+    _renderPanel() {
+      const p = this.panels[this.current];
+      if (!p) return;
+      document.getElementById('comicTitle').textContent = '📖 ' + (this.story.title || 'ХРОНИКИ');
+      const cap = document.getElementById('comicCaption');
+      if (p.caption) { cap.style.display = 'block'; cap.textContent = p.caption; }
+      else cap.style.display = 'none';
+      document.getElementById('comicSpeaker').textContent = p.speaker === 'Narrator' ? '' : p.speaker + ': ';
+      document.getElementById('comicDialogue').textContent = p.dialogue;
+      document.getElementById('comicImg').innerHTML = p.image_url ? `<img src="${p.image_url}">` : '🎨';
+      document.getElementById('comicPrev').disabled = this.current === 0;
+      document.getElementById('comicNext').textContent = this.current >= this.panels.length - 1 ? 'ЗАКРЫТЬ' : 'ВПЕРЁД ▶';
+      this._renderDots();
+    },
+
+    _renderDots() {
+      const dots = document.getElementById('comicDots');
+      dots.innerHTML = this.panels.map((_, i) => `<div class="dot${i === this.current ? ' active' : ''}"></div>`).join('');
+    },
+
+    next() {
+      if (this.current >= this.panels.length - 1) { this.close(); return; }
+      this.current++;
+      this._renderPanel();
+    },
+    prev() { if (this.current > 0) { this.current--; this._renderPanel(); } },
+    close() { UI.show('kingdom'); UI.renderKingdom(); },
+  };
+
+  console.log('[AI] Kingdom Match AI Client v0.1 загружен');
+})();
